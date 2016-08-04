@@ -1,0 +1,7 @@
+config SECURITY_WEIR
+       bool "WEIR DIFC System for Android"
+       depends on SECURITY && ANDROID_BINDER_IPC
+       default n
+       help
+	 This selects the WEIR DIFC system for Android.
+	 If you are unsure how to answer this question, answer N.

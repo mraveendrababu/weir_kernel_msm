@@ -1,0 +1,2052 @@
+diff --git a/ext3co/CHANGELOG b/ext3co/CHANGELOG
+new file mode 100644
+index 0000000..9eb01d0
+--- /dev/null
++++ b/ext3co/CHANGELOG
+@@ -0,0 +1,12 @@
++3-9-08
++- Fixed a bug that resulted in the first block in a newly allocated indirect block to be allocated over and over again.
++- Fixed a bug that resulted in COW bitmaps not to be reset after truncate.
++- Bug e2fsprogs that caused aborting journal fixed.
++
++6-20-97
++- Finished the rollback code for inode chains in case of error.
++
++6-18-07
++- Added support for 32-bit uid's and gid's back in again
++- Took out support for block fragmentation
++- Hopefully fixed the non-sticking uid/gid bug.
+\ No newline at end of file
+diff --git a/ext3/balloc.c b/ext3co/balloc.c
+index 2216174..507f8df 100644
+--- a/ext3/balloc.c
++++ b/ext3co/balloc.c
+@@ -439,6 +439,8 @@ void ext3_free_blocks_sb(handle_t *handle, struct super_block *sb,
+ 		goto error_return;
+ 	}
+ 
++  //TODO: Remove:
++  printk(KERN_INFO "freeing block(s) %lu-%lu\n", block, block + count - 1);
+ 	ext3_debug ("freeing block(s) %lu-%lu\n", block, block + count - 1);
+ 
+ do_more:
+diff --git a/ext3/dir.c b/ext3co/dir.c
+index 665adee..bd0ec90 100644
+--- a/ext3/dir.c
++++ b/ext3co/dir.c
+@@ -63,6 +63,185 @@ static unsigned char get_dtype(struct super_block *sb, int filetype)
+ 	return (ext3_filetype_table[filetype]);
+ }
+ 
++static int ext3_readversions(struct file * filp, void * dirent, 
++                                filldir_t filldir)
++{
++  int error = 0;
++  unsigned long offset;
++  int i, stored;
++  struct buffer_head *bh;
++  struct ext3_dir_entry_2 * de;
++  struct super_block * sb;
++  int err;
++  struct inode *dir = filp->f_dentry->d_inode;
++  char *at;
++  unsigned long ino;
++  int ref_len = filp->f_dentry->d_name.len -1;
++  
++  sb = dir->i_sb;
++  
++  stored = 0;
++  bh = NULL;
++  offset = filp->f_pos & (sb->s_blocksize - 1);
++  
++  at = strrchr(filp->f_dentry->d_name.name, EXT3_FLUX_TOKEN);
++  
++  while (!error && !stored && filp->f_pos < dir->i_size) {
++    unsigned long blk = (filp->f_pos) >> EXT3_BLOCK_SIZE_BITS(sb);
++    struct buffer_head map_bh;
++
++    bh = NULL;
++    map_bh.b_state = 0;
++		err = ext3_get_blocks_handle(NULL, dir, blk, 1,
++						&map_bh, 0, 0);
++		if (err > 0) {
++			page_cache_readahead(sb->s_bdev->bd_inode->i_mapping,
++				&filp->f_ra,
++				filp,
++				map_bh.b_blocknr >>
++					(PAGE_CACHE_SHIFT - dir->i_blkbits),
++				1);
++			bh = ext3_bread(NULL, dir, blk, 0, &err);
++		}
++
++		/*
++		 * We ignore I/O errors on directories so users have a chance
++		 * of recovering data when there's a bad sector
++		 */
++    if (!bh) {
++      ext3_error (sb, "ext3_versions",
++                     "directory #%lu contains a hole at offset %lu",
++                     dir->i_ino, (unsigned long)filp->f_pos);
++      /* corrupt size?  Maybe no more blocks to read */
++			if (filp->f_pos > dir->i_blocks << 9)
++				break;
++      filp->f_pos += sb->s_blocksize - offset;
++      continue;
++    }
++    
++  ver_revalidate:
++    /* If the dir block has changed since the last call to
++     * readdir(2), then we might be pointing to an invalid
++     * dirent right now.  Scan from the start of the block
++     * to make sure. */
++    if (filp->f_version != dir->i_version) {
++      for (i = 0; i < sb->s_blocksize && i < offset; ) {
++        de = (struct ext3_dir_entry_2 *) 
++          (bh->b_data + i);
++				/* It's too expensive to do a full
++				 * dirent test each time round this
++				 * loop, but we do have to test at
++				 * least that it is non-zero.  A
++				 * failure will be detected in the
++				 * dirent test below. */
++        if (le16_to_cpu(de->rec_len) <
++            EXT3_DIR_REC_LEN(1))
++          break;
++        i += le16_to_cpu(de->rec_len);
++      }
++      offset = i;
++      filp->f_pos = (filp->f_pos & ~(sb->s_blocksize - 1))
++        | offset;
++      filp->f_version = dir->i_version;
++    }
++    
++    while (!error && filp->f_pos < dir->i_size 
++           && offset < sb->s_blocksize) {
++      de = (struct ext3_dir_entry_2 *) (bh->b_data + offset);
++      if (!ext3_check_dir_entry ("ext3_readversions", dir, de,
++                                    bh, offset)) {
++				/* On error, skip the f_pos to the
++           next block. */
++        filp->f_pos = (filp->f_pos |
++                       (sb->s_blocksize - 1)) + 1;
++        brelse (bh);
++        return stored;
++      }
++      offset += le16_to_cpu(de->rec_len);
++      
++      if (le32_to_cpu(de->inode)){
++        unsigned long version = filp->f_version;
++        unsigned char d_type = DT_UNKNOWN;
++        
++        /* We might block in the next section
++         * if the data destination is
++         * currently swapped out.  So, use a
++         * version stamp to detect whether or
++         * not the directory has been modified
++         * during the copy operation.
++         */
++        
++        if (EXT3_HAS_INCOMPAT_FEATURE(sb,
++                                         EXT3_FEATURE_INCOMPAT_FILETYPE)
++            && de->file_type < EXT3_FT_MAX)
++          d_type =
++            ext3_filetype_table[de->file_type];
++        if (de->name_len == ref_len
++            && strncmp(filp->f_dentry->d_name.name, de->name, ref_len)==0) {
++          
++          struct inode * inde;
++          char * name;
++          
++          name = kmalloc(EXT3_NAME_LEN, GFP_KERNEL);
++          strncpy(name, de->name, de->name_len);
++          inde = iget(dir->i_sb, de->inode);
++          
++          if (de->death_epoch!=0 && de->birth_epoch!=de->death_epoch) {
++            name[de->name_len]='\0';
++            sprintf(name,"%s@%d",name, de->death_epoch);
++            error = filldir(dirent, name,
++                            strlen(name),
++                            filp->f_pos,
++                            le32_to_cpu(inde->i_ino),
++                            d_type);
++            stored++;
++          }
++          
++          while (EXT3_I(inde)->i_next_inode!=0) {
++            name[de->name_len]='\0';
++            sprintf(name,"%s@%d",name, EXT3_I_EPOCHNUMBER(inde));
++            error = filldir(dirent, name,
++                            strlen(name),
++                            filp->f_pos,
++                            le32_to_cpu(inde->i_ino),
++                            d_type);
++            ino = EXT3_I(inde)->i_next_inode;
++            iput(inde);
++            inde = iget(dir->i_sb, ino);
++            stored++;
++          }
++          
++          kfree(name);
++          iput(inde);
++                    
++          if (error)
++            break;
++          
++          if (!stored && 
++              EXT3_IS_DIRENT_SCOPED(de, EXT3_I_EPOCHNUMBER(dir))) {
++            error = filldir(dirent, de->name,
++                            de->name_len,
++                            filp->f_pos,
++                            le32_to_cpu(de->inode),
++                            d_type);
++          }
++            
++          if (error)
++            break;
++          if (version != filp->f_version)
++            goto ver_revalidate;
++          stored ++;
++        }
++      }
++      
++      filp->f_pos += le16_to_cpu(de->rec_len);
++    }
++    offset = 0;
++    brelse (bh);
++  }
++  return 0;
++}
++
+ 
+ int ext3_check_dir_entry (const char * function, struct inode * dir,
+ 			  struct ext3_dir_entry_2 * de,
+@@ -71,6 +250,7 @@ int ext3_check_dir_entry (const char * function, struct inode * dir,
+ {
+ 	const char * error_msg = NULL;
+ 	const int rlen = le16_to_cpu(de->rec_len);
++  unsigned int current_epoch = EXT3_S_EPOCHNUMBER(dir->i_sb);
+ 
+ 	if (rlen < EXT3_DIR_REC_LEN(1))
+ 		error_msg = "rec_len is smaller than minimal";
+@@ -83,14 +263,23 @@ int ext3_check_dir_entry (const char * function, struct inode * dir,
+ 	else if (le32_to_cpu(de->inode) >
+ 			le32_to_cpu(EXT3_SB(dir->i_sb)->s_es->s_inodes_count))
+ 		error_msg = "inode out of bounds";
++  /* Some bounds on versioned entries -znjp*/
++  else if (le32_to_cpu(de->death_epoch) != EXT3_DIRENT_ALIVE && 
++           le32_to_cpu(de->birth_epoch) > le32_to_cpu(de->death_epoch))
++    error_msg = "entry died before it was born";
++  else if (le32_to_cpu(de->birth_epoch) > current_epoch)
++    error_msg = "entry was born in the future";
++  else if (le32_to_cpu(de->death_epoch) > current_epoch)
++    error_msg = "entry has already died in the future";
+ 
+ 	if (error_msg != NULL)
+ 		ext3_error (dir->i_sb, function,
+ 			"bad entry in directory #%lu: %s - "
+-			"offset=%lu, inode=%lu, rec_len=%d, name_len=%d",
++			"offset=%lu, inode=%lu, rec_len=%d, name_len=%d, "
++      "birth_epoch=%d death_epoch=%d",
+ 			dir->i_ino, error_msg, offset,
+ 			(unsigned long) le32_to_cpu(de->inode),
+-			rlen, de->name_len);
++                   rlen, de->name_len, de->birth_epoch, de->death_epoch);
+ 	return error_msg == NULL ? 1 : 0;
+ }
+ 
+@@ -105,14 +294,20 @@ static int ext3_readdir(struct file * filp,
+ 	int err;
+ 	struct inode *inode = filp->f_path.dentry->d_inode;
+ 	int ret = 0;
+-
++  
++  /* is this a version listing? */
++  if (filp->f_dentry->d_name.name[filp->f_dentry->d_name.len-1] ==  
++      EXT3_FLUX_TOKEN)
++    return ext3_readversions(filp, dirent, filldir);
++  
+ 	sb = inode->i_sb;
+ 
+ #ifdef CONFIG_EXT3_INDEX
+-	if (EXT3_HAS_COMPAT_FEATURE(inode->i_sb,
+-				    EXT3_FEATURE_COMPAT_DIR_INDEX) &&
++	if (EXT3_HAS_COMPAT_FEATURE(inode->i_sb, 
++                                 EXT3_FEATURE_COMPAT_DIR_INDEX) &&
+ 	    ((EXT3_I(inode)->i_flags & EXT3_INDEX_FL) ||
+ 	     ((inode->i_size >> sb->s_blocksize_bits) == 1))) {
++
+ 		err = ext3_dx_readdir(filp, dirent, filldir);
+ 		if (err != ERR_BAD_DX_DIR) {
+ 			ret = err;
+@@ -201,7 +396,21 @@ revalidate:
+ 				goto out;
+ 			}
+ 			offset += le16_to_cpu(de->rec_len);
+-			if (le32_to_cpu(de->inode)) {
++    /*
++        printk("Inode %ld Epoch number %u: is 
++        dir %d -> %s be %d de %d scoped? %d\n",
++        dir->i_ino,
++        EXT3_I_EPOCHNUMBER(dir),
++        de->inode,
++        de->name,
++        de->birth_epoch,
++        de->death_epoch,
++        EXT3_IS_DIRENT_SCOPED(de, EXT3_I_EPOCHNUMBER(dir)));
++      */
++
++      /* Only add scoped dirents - znjp */
++			if (le32_to_cpu(de->inode)  && 
++          EXT3_IS_DIRENT_SCOPED(de, EXT3_I_EPOCHNUMBER(inode))) {
+ 				/* We might block in the next section
+ 				 * if the data destination is
+ 				 * currently swapped out.  So, use a
+@@ -408,6 +617,8 @@ static int call_filldir(struct file * filp, void * dirent,
+ 
+ 	sb = inode->i_sb;
+ 
++  printk(KERN_INFO, "Got %s\n", filp->f_path.dentry->d_name.name);
++
+ 	if (!fname) {
+ 		printk("call_filldir: called with null fname?!?\n");
+ 		return 0;
+diff --git a/ext3/ext3_jbd.c b/ext3/ext3_jbd.c
+deleted file mode 100644
+index e1f91fd..0000000
+--- a/ext3/ext3_jbd.c
++++ /dev/null
+@@ -1,59 +0,0 @@
+-/*
+- * Interface between ext3 and JBD
+- */
+-
+-#include <linux/ext3_jbd.h>
+-
+-int __ext3_journal_get_undo_access(const char *where, handle_t *handle,
+-				struct buffer_head *bh)
+-{
+-	int err = journal_get_undo_access(handle, bh);
+-	if (err)
+-		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
+-	return err;
+-}
+-
+-int __ext3_journal_get_write_access(const char *where, handle_t *handle,
+-				struct buffer_head *bh)
+-{
+-	int err = journal_get_write_access(handle, bh);
+-	if (err)
+-		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
+-	return err;
+-}
+-
+-int __ext3_journal_forget(const char *where, handle_t *handle,
+-				struct buffer_head *bh)
+-{
+-	int err = journal_forget(handle, bh);
+-	if (err)
+-		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
+-	return err;
+-}
+-
+-int __ext3_journal_revoke(const char *where, handle_t *handle,
+-				unsigned long blocknr, struct buffer_head *bh)
+-{
+-	int err = journal_revoke(handle, blocknr, bh);
+-	if (err)
+-		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
+-	return err;
+-}
+-
+-int __ext3_journal_get_create_access(const char *where,
+-				handle_t *handle, struct buffer_head *bh)
+-{
+-	int err = journal_get_create_access(handle, bh);
+-	if (err)
+-		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
+-	return err;
+-}
+-
+-int __ext3_journal_dirty_metadata(const char *where,
+-				handle_t *handle, struct buffer_head *bh)
+-{
+-	int err = journal_dirty_metadata(handle, bh);
+-	if (err)
+-		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
+-	return err;
+-}
+diff --git a/ext3co/ext3cow_jbd.c b/ext3co/ext3cow_jbd.c
+new file mode 100644
+index 0000000..e1f91fd
+--- /dev/null
++++ b/ext3co/ext3cow_jbd.c
+@@ -0,0 +1,59 @@
++/*
++ * Interface between ext3 and JBD
++ */
++
++#include <linux/ext3_jbd.h>
++
++int __ext3_journal_get_undo_access(const char *where, handle_t *handle,
++				struct buffer_head *bh)
++{
++	int err = journal_get_undo_access(handle, bh);
++	if (err)
++		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
++	return err;
++}
++
++int __ext3_journal_get_write_access(const char *where, handle_t *handle,
++				struct buffer_head *bh)
++{
++	int err = journal_get_write_access(handle, bh);
++	if (err)
++		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
++	return err;
++}
++
++int __ext3_journal_forget(const char *where, handle_t *handle,
++				struct buffer_head *bh)
++{
++	int err = journal_forget(handle, bh);
++	if (err)
++		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
++	return err;
++}
++
++int __ext3_journal_revoke(const char *where, handle_t *handle,
++				unsigned long blocknr, struct buffer_head *bh)
++{
++	int err = journal_revoke(handle, blocknr, bh);
++	if (err)
++		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
++	return err;
++}
++
++int __ext3_journal_get_create_access(const char *where,
++				handle_t *handle, struct buffer_head *bh)
++{
++	int err = journal_get_create_access(handle, bh);
++	if (err)
++		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
++	return err;
++}
++
++int __ext3_journal_dirty_metadata(const char *where,
++				handle_t *handle, struct buffer_head *bh)
++{
++	int err = journal_dirty_metadata(handle, bh);
++	if (err)
++		ext3_journal_abort_handle(where, __FUNCTION__, bh, handle,err);
++	return err;
++}
+diff --git a/ext3/file.c b/ext3co/file.c
+index 881f636..5e45982 100644
+--- a/ext3/file.c
++++ b/ext3co/file.c
+@@ -53,8 +53,16 @@ ext3_file_write(struct kiocb *iocb, const struct iovec *iov,
+ {
+ 	struct file *file = iocb->ki_filp;
+ 	struct inode *inode = file->f_path.dentry->d_inode;
+-	ssize_t ret;
+-	int err;
++  struct inode *dir   = file->f_path.dentry->d_parent->d_inode;
++	ssize_t ret = 0;
++	int err = 0;
++  
++  /* This is the place where we create a new version on write -znjp */
++  if(EXT3_S_EPOCHNUMBER(inode->i_sb) > EXT3_I_EPOCHNUMBER(inode)){
++    err = ext3_dup_inode(dir, inode);
++    if(err)
++      return err;
++  }
+ 
+ 	ret = generic_file_aio_write(iocb, iov, nr_segs, pos);
+ 
+diff --git a/ext3/ialloc.c b/ext3co/ialloc.c
+index e45dbd6..8ca75ca 100644
+--- a/ext3/ialloc.c
++++ b/ext3co/ialloc.c
+@@ -562,6 +562,11 @@ got:
+ 	inode->i_blocks = 0;
+ 	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME_SEC;
+ 
++  /* For versioning -znjp */
++  ei->i_cow_bitmap   = 0x0000;
++  ei->i_epoch_number = EXT3_S_EPOCHNUMBER(dir->i_sb);
++  ei->i_next_inode   = 0;
++
+ 	memset(ei->i_data, 0, sizeof(ei->i_data));
+ 	ei->i_dir_start_lookup = 0;
+ 	ei->i_disksize = 0;
+@@ -573,9 +578,10 @@ got:
+ 	if (!S_ISDIR(mode))
+ 		ei->i_flags &= ~EXT3_DIRSYNC_FL;
+ #ifdef EXT3_FRAGMENTS
+-	ei->i_faddr = 0;
+-	ei->i_frag_no = 0;
+-	ei->i_frag_size = 0;
++  /* Taken out for versioning -znjp */
++	//ei->i_faddr = 0;
++	//ei->i_frag_no = 0;
++	//ei->i_frag_size = 0;
+ #endif
+ 	ei->i_file_acl = 0;
+ 	ei->i_dir_acl = 0;
+diff --git a/ext3/inode.c b/ext3co/inode.c
+index beaf25f..a87265d 100644
+--- a/ext3/inode.c
++++ b/ext3co/inode.c
+@@ -253,6 +253,25 @@ static int verify_chain(Indirect *from, Indirect *to)
+ 	return (from > to);
+ }
+ 
++//TODO: Delete at some point
++/* znjp - used for bitmap testing */
++
++ static void printbin(u32 val, int size) {
++  u32 mask;
++  
++  mask=(1UL << (size-1));
++  while (mask) {
++    if (mask & val) 
++      printk("1");
++    else 
++      printk("0");
++    mask /= 2;
++  }
++  printk("\n");
++ 
++ }
++
++
+ /**
+  *	ext3_block_to_path - parse the block number into array of offsets
+  *	@inode: inode in question (we are only interested in its superblock)
+@@ -287,11 +306,12 @@ static int verify_chain(Indirect *from, Indirect *to)
+ static int ext3_block_to_path(struct inode *inode,
+ 			long i_block, int offsets[4], int *boundary)
+ {
++  /* TODO: Check for efficientcy -znjp */
+ 	int ptrs = EXT3_ADDR_PER_BLOCK(inode->i_sb);
+-	int ptrs_bits = EXT3_ADDR_PER_BLOCK_BITS(inode->i_sb);
+ 	const long direct_blocks = EXT3_NDIR_BLOCKS,
+ 		indirect_blocks = ptrs,
+-		double_blocks = (1 << (ptrs_bits * 2));
++    double_blocks = (ptrs * ptrs);
++		//double_blocks = (1 << (ptrs_bits * 2));
+ 	int n = 0;
+ 	int final = 0;
+ 
+@@ -306,14 +326,15 @@ static int ext3_block_to_path(struct inode *inode,
+ 		final = ptrs;
+ 	} else if ((i_block -= indirect_blocks) < double_blocks) {
+ 		offsets[n++] = EXT3_DIND_BLOCK;
+-		offsets[n++] = i_block >> ptrs_bits;
+-		offsets[n++] = i_block & (ptrs - 1);
++		offsets[n++] = (i_block/ptrs); //i_block >> ptrs_bits;
++		offsets[n++] = (i_block%ptrs); //i_block & (ptrs - 1);
+ 		final = ptrs;
+-	} else if (((i_block -= double_blocks) >> (ptrs_bits * 2)) < ptrs) {
++	} else if (((i_block -= double_blocks)/(double_blocks)) < ptrs) {
++    //	} else if (((i_block -= double_blocks) >> (ptrs_bits * 2)) < ptrs) {
+ 		offsets[n++] = EXT3_TIND_BLOCK;
+-		offsets[n++] = i_block >> (ptrs_bits * 2);
+-		offsets[n++] = (i_block >> ptrs_bits) & (ptrs - 1);
+-		offsets[n++] = i_block & (ptrs - 1);
++		offsets[n++] = (i_block/double_blocks); //i_block >> (ptrs_bits * 2);
++		offsets[n++] = (i_block/double_blocks)%ptrs; //(i_block >> ptrs_bits) & (ptrs - 1);
++		offsets[n++] = i_block%ptrs; //i_block & (ptrs - 1);
+ 		final = ptrs;
+ 	} else {
+ 		ext3_warning(inode->i_sb, "ext3_block_to_path", "block > big");
+@@ -351,30 +372,82 @@ static int ext3_block_to_path(struct inode *inode,
+  *		(ditto, *@err == -EAGAIN)
+  *	or when it reads all @depth-1 indirect blocks successfully and finds
+  *	the whole chain, all way to the data (returns %NULL, *err == 0).
++ *  If this is COW we set the cow field to 1.  We know if it's COW
++ *  because there will already be a key.  We need this field so we
++ *  zero out the data already in the buffer.
++ *  The create flag let's us know if were just looking for a block
++ *  to read, or a block to write.  We only set the bitmap when
++ *  we're looking for a block to write, either on new allocation
++ *  or on COWing. -znjp
+  */
+-static Indirect *ext3_get_branch(struct inode *inode, int depth, int *offsets,
+-				 Indirect chain[4], int *err)
++static Indirect *ext3_get_branch(struct inode *inode, int depth, 
++                                    int *offsets,
++                                    Indirect chain[4], int *err, int *cow,
++                                    int create)
+ {
+ 	struct super_block *sb = inode->i_sb;
+ 	Indirect *p = chain;
+-	struct buffer_head *bh;
++	struct buffer_head *bh = NULL;
++  u32 *bitmap_w = NULL;
++  int ptrs = EXT3_ADDR_PER_BLOCK(inode->i_sb);
++  int nbitsperword = (sizeof(u32) * 8);
+ 
+ 	*err = 0;
++  *cow = 0;
++
++
+ 	/* i_data is not going away, no lock needed */
+ 	add_chain (chain, NULL, EXT3_I(inode)->i_data + *offsets);
+-	if (!p->key)
++	if (!p->key){
++    /* Set the bitmap on allocation - znjp */
++    if(create){
++      EXT3_I(inode)->i_cow_bitmap |= (1UL << *offsets);
++    }
+ 		goto no_block;
++  }
++
++  /* Are we writing and COWing any direct blocks? -znjp */
++  if(create && !(EXT3_I(inode)->i_cow_bitmap & (1UL << *offsets))){    
++    //printk(KERN_INFO "COWing direct block\n");
++    *(p->p) = 0;
++    p->key = 0;
++    /* Set the bitamp when COWing -znjp */
++    EXT3_I(inode)->i_cow_bitmap |= (1UL << *offsets);
++    *cow = 1;
++    goto no_block;
++  }
++
+ 	while (--depth) {
++
+ 		bh = sb_bread(sb, le32_to_cpu(p->key));
+ 		if (!bh)
+ 			goto failure;
++
+ 		/* Reader: pointers */
+ 		if (!verify_chain(chain, p))
+ 			goto changed;
+ 		add_chain(++p, bh, (__le32*)bh->b_data + *++offsets);
+ 		/* Reader: end */
+-		if (!p->key)
++    /* Find correct bitmap word */
++    bitmap_w = (u32*)bh->b_data + ptrs + (*offsets/nbitsperword);
++		if (!p->key){
++      /* Set the bitmap when allocating -znjp */
++      if(create){
++       *bitmap_w |= (u32)(1UL << (int)(*offsets%nbitsperword));
++      }
+ 			goto no_block;
++    }
++
++    /* Are we COWing any indirect blocks? -znjp */
++    if(create && !(*bitmap_w & (1UL << (int)(*offsets%nbitsperword)))){
++      //printk(KERN_INFO "COWing indirect block\n");
++      *(p->p) = 0;
++      p->key = 0;
++      /* Set the bitmap -znjp */
++      *bitmap_w |= (u32)(1UL << (int)(*offsets%nbitsperword));
++      *cow = 1;
++      goto no_block;
++    }
+ 	}
+ 	return NULL;
+ 
+@@ -603,6 +676,10 @@ static int ext3_alloc_branch(handle_t *handle, struct inode *inode,
+ 	ext3_fsblk_t new_blocks[4];
+ 	ext3_fsblk_t current_block;
+ 
++  u32 *bitmap_w = NULL;
++  int ptrs = EXT3_ADDR_PER_BLOCK(inode->i_sb);
++  int nbitsperword = (sizeof(u32) * 8);
++
+ 	num = ext3_alloc_blocks(handle, inode, goal, indirect_blks,
+ 				*blks, new_blocks, &err);
+ 	if (err)
+@@ -612,6 +689,7 @@ static int ext3_alloc_branch(handle_t *handle, struct inode *inode,
+ 	/*
+ 	 * metadata blocks and data blocks are allocated.
+ 	 */
++
+ 	for (n = 1; n <= indirect_blks;  n++) {
+ 		/*
+ 		 * Get buffer_head for parent block, zero it out
+@@ -630,6 +708,13 @@ static int ext3_alloc_branch(handle_t *handle, struct inode *inode,
+ 		}
+ 
+ 		memset(bh->b_data, 0, blocksize);
++    /* Mark the cow bitmap for each new indirect block allocated.
++     * We had to put this here, because get_branch was insufficient
++     * when allocating an indirect block. -znjp
++     */
++    bitmap_w = (u32*)bh->b_data + ptrs + (offsets[n]/nbitsperword);
++    *bitmap_w |= (u32)(1UL << (int)(offsets[n]%nbitsperword));
++
+ 		branch[n].p = (__le32 *) bh->b_data + offsets[n];
+ 		branch[n].key = cpu_to_le32(new_blocks[n]);
+ 		*branch[n].p = branch[n].key;
+@@ -802,6 +887,7 @@ int ext3_get_blocks_handle(handle_t *handle, struct inode *inode,
+ 	struct ext3_inode_info *ei = EXT3_I(inode);
+ 	int count = 0;
+ 	ext3_fsblk_t first_block = 0;
++  int cow = 0; /* To determine wether we clear the buffer of not -znjp */
+ 
+ 
+ 	J_ASSERT(handle != NULL || create == 0);
+@@ -810,12 +896,14 @@ int ext3_get_blocks_handle(handle_t *handle, struct inode *inode,
+ 	if (depth == 0)
+ 		goto out;
+ 
+-	partial = ext3_get_branch(inode, depth, offsets, chain, &err);
++	partial = ext3_get_branch(inode, depth, offsets, 
++                               chain, &err, &cow, create);
+ 
+ 	/* Simplest case - block found, no allocation needed */
+ 	if (!partial) {
+ 		first_block = le32_to_cpu(chain[depth - 1].key);
+-		clear_buffer_new(bh_result);
++    if(!cow) /* Don't clear the buffer if it's a COW allocation -znjp */
++      clear_buffer_new(bh_result);
+ 		count++;
+ 		/*map more blocks*/
+ 		while (count < maxblocks && count <= blocks_to_boundary) {
+@@ -867,13 +955,16 @@ int ext3_get_blocks_handle(handle_t *handle, struct inode *inode,
+ 			brelse(partial->bh);
+ 			partial--;
+ 		}
+-		partial = ext3_get_branch(inode, depth, offsets, chain, &err);
++		partial = ext3_get_branch(inode, depth, offsets, 
++                                 chain, &err, &cow, create);
+ 		if (!partial) {
+ 			count++;
+ 			mutex_unlock(&ei->truncate_mutex);
+ 			if (err)
+ 				goto cleanup;
+-			clear_buffer_new(bh_result);
++      /* Don't clear the buffer if we're COWing it -znjp */
++      if(!cow)
++        clear_buffer_new(bh_result);
+ 			goto got_it;
+ 		}
+ 	}
+@@ -1208,6 +1299,14 @@ skip:
+ 	return mapping->a_ops->commit_write(file, page, from, block_start);
+ }
+ 
++/* Used to quickly unmap all buffers in a page for COWing -znjp */
++static int ext3_clear_buffer_mapped(handle_t *handle, 
++                                       struct buffer_head *bh)
++{
++  clear_buffer_mapped(bh);
++  return 0;
++}
++
+ static int ext3_prepare_write(struct file *file, struct page *page,
+ 			      unsigned from, unsigned to)
+ {
+@@ -1221,6 +1320,11 @@ retry:
+ 	handle = ext3_journal_start(inode, needed_blocks);
+ 	if (IS_ERR(handle))
+ 		return PTR_ERR(handle);
++  /* Unset the BH_Mapped flag so get_block is always called -znjp */
++  if(page_has_buffers(page))
++    ret = walk_page_buffers(handle, page_buffers(page),
++                            from, to, NULL, ext3_clear_buffer_mapped);
++
+ 	if (test_opt(inode->i_sb, NOBH) && ext3_should_writeback_data(inode))
+ 		ret = nobh_prepare_write(page, from, to, ext3_get_block);
+ 	else
+@@ -1975,13 +2079,13 @@ static Indirect *ext3_find_shared(struct inode *inode, int depth,
+ 			int offsets[4], Indirect chain[4], __le32 *top)
+ {
+ 	Indirect *partial, *p;
+-	int k, err;
++	int k, err, cow;
+ 
+ 	*top = 0;
+ 	/* Make k index the deepest non-null offest + 1 */
+ 	for (k = depth; k > 1 && !offsets[k-1]; k--)
+ 		;
+-	partial = ext3_get_branch(inode, k, offsets, chain, &err);
++	partial = ext3_get_branch(inode, k, offsets, chain, &err, &cow, 0);
+ 	/* Writer: pointers */
+ 	if (!partial)
+ 		partial = chain + k-1;
+@@ -2166,6 +2270,9 @@ static void ext3_free_branches(handle_t *handle, struct inode *inode,
+ 	if (depth--) {
+ 		struct buffer_head *bh;
+ 		int addr_per_block = EXT3_ADDR_PER_BLOCK(inode->i_sb);
++    u32 *bitmap_word = NULL, *first_block = NULL;
++    unsigned int count = 0, cur = 0, bcount = 0;
++    int i = 0;
+ 		p = last;
+ 		while (--p >= first) {
+ 			nr = le32_to_cpu(*p);
+@@ -2185,13 +2292,42 @@ static void ext3_free_branches(handle_t *handle, struct inode *inode,
+ 					   inode->i_ino, nr);
+ 				continue;
+ 			}
+-
+-			/* This zaps the entire block.  Bottom up. */
+-			BUFFER_TRACE(bh, "free child branches");
+-			ext3_free_branches(handle, inode, bh,
+-					   (__le32*)bh->b_data,
+-					   (__le32*)bh->b_data + addr_per_block,
+-					   depth);
++      /* Only free the branches that have been newly allocated - znjp */
++      /* Also, set the bits back to 0 in the bitmap -znjp */
++      cur = 0;
++      count = 0;
++      bitmap_word = (u32*)bh->b_data + addr_per_block;
++      
++      for(bcount = 0; bcount < EXT3_COWBITMAPS_PER_IBLOCK(inode->i_sb);
++          bcount++){
++        for(i = 0; i < EXT3_COWBITMAP_SIZE; i++, cur++){
++          if(cur >= addr_per_block)
++            goto free;
++          if(le32_to_cpu(*bitmap_word) & (1UL << i)){
++            if(count == 0){
++              first_block = (u32*)bh->b_data + cur;
++              count = 1;
++            }else if((u32*)first_block + count == (u32*)bh->b_data + cur){
++              count++;
++            }else{
++              BUFFER_TRACE(bh, "free child branches");
++              ext3_free_branches(handle, inode, bh, (u32*)first_block,
++                                    (u32*)first_block + count, depth);
++              first_block = (u32*)bh->b_data + cur;
++              count = 1;
++            }
++            /* Set the bit in the bitmap back to 0 */
++            *bitmap_word ^= (1UL << i);
++          }
++        }
++        (u32*)bitmap_word++;
++      }   
++    free:
++      if(count){
++        BUFFER_TRACE(bh, "free child branches");
++        ext3_free_branches(handle, inode, bh, (u32*)first_block,
++                              (u32*)first_block + count, depth);
++      }
+ 
+ 			/*
+ 			 * We've probably journalled the indirect block several
+@@ -2306,14 +2442,24 @@ void ext3_truncate(struct inode *inode)
+ 	unsigned blocksize = inode->i_sb->s_blocksize;
+ 	struct page *page;
+ 
++
+ 	if (!(S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode) ||
+ 	    S_ISLNK(inode->i_mode)))
+ 		return;
+ 	if (ext3_inode_is_fast_symlink(inode))
+ 		return;
+-	if (IS_APPEND(inode) || IS_IMMUTABLE(inode))
++	if (IS_APPEND(inode) || IS_IMMUTABLE(inode) || 
++      EXT3_IS_UNCHANGEABLE(inode)) /* znjp */
+ 		return;
+ 
++  /* If the inode needs to be dup'd, then there are no blocks
++   * to truncate; they all are part of the previous version.
++   * - znjp */
++  if(EXT3_S_EPOCHNUMBER(inode->i_sb) > EXT3_I_EPOCHNUMBER(inode)){
++    ext3_dup_inode(NULL, inode);
++    return;
++  }
++
+ 	/*
+ 	 * We have to lock the EOF page here, because lock_page() nests
+ 	 * outside journal_start().
+@@ -2377,8 +2523,35 @@ void ext3_truncate(struct inode *inode)
+ 	mutex_lock(&ei->truncate_mutex);
+ 
+ 	if (n == 1) {		/* direct blocks */
+-		ext3_free_data(handle, inode, NULL, i_data+offsets[0],
+-			       i_data + EXT3_NDIR_BLOCKS);
++    unsigned int count = 0;
++    unsigned long block_to_free = 0;
++    unsigned long b = 0; 
++
++    /* We only want to remove blocks that were allocated in this
++     * epoch, i.e., have 1 bit in the bitmap. -znjp */
++    /* If we're going to truncate a block, we should its
++     * corresponding bit in the bitmap back to 0, meaning,
++     * it needs to be allocated - znjp */ 
++    for(b = offsets[0]; b < EXT3_NDIR_BLOCKS; b++){
++      if(EXT3_I(inode)->i_cow_bitmap & (1UL << b)){
++        if(count == 0){
++          block_to_free = b;
++          count = 1;
++        }else if(b == block_to_free + count){
++          count++;
++        }else{
++          ext3_free_data(handle, inode, NULL, i_data + (int)block_to_free,
++                            i_data + (int)(block_to_free + count));
++          block_to_free = b;
++          count = 1;
++        }
++        /* Turn off the bit in the bitmap */
++        EXT3_I(inode)->i_cow_bitmap ^= (1UL << b);
++      }
++    }
++    if(count > 0)
++      ext3_free_data(handle, inode, NULL, i_data+(int)block_to_free,
++                        i_data + (int)(block_to_free + count));
+ 		goto do_indirects;
+ 	}
+ 
+@@ -2413,25 +2586,38 @@ void ext3_truncate(struct inode *inode)
+ 	}
+ do_indirects:
+ 	/* Kill the remaining (whole) subtrees */
++  /* Unless we don't have to.  If the indirect block has a 0 bit
++   * then all of the children do too, so we can skip the branch - znjp
++   */
+ 	switch (offsets[0]) {
+ 	default:
+-		nr = i_data[EXT3_IND_BLOCK];
+-		if (nr) {
+-			ext3_free_branches(handle, inode, NULL, &nr, &nr+1, 1);
+-			i_data[EXT3_IND_BLOCK] = 0;
+-		}
++   if(EXT3_I(inode)->i_cow_bitmap & (1UL << EXT3_IND_BLOCK)){
++     nr = i_data[EXT3_IND_BLOCK];
++     if (nr) {
++       ext3_free_branches(handle, inode, NULL, &nr, &nr+1, 1);
++       i_data[EXT3_IND_BLOCK] = 0;
++     }
++     /* And set bitmap back to 0 */
++     EXT3_I(inode)->i_cow_bitmap ^= (1UL << EXT3_IND_BLOCK);
++   }
+ 	case EXT3_IND_BLOCK:
+-		nr = i_data[EXT3_DIND_BLOCK];
+-		if (nr) {
+-			ext3_free_branches(handle, inode, NULL, &nr, &nr+1, 2);
+-			i_data[EXT3_DIND_BLOCK] = 0;
+-		}
++   if(EXT3_I(inode)->i_cow_bitmap & (1UL << EXT3_DIND_BLOCK)){
++     nr = i_data[EXT3_DIND_BLOCK];
++     if (nr) {
++       ext3_free_branches(handle, inode, NULL, &nr, &nr+1, 2);
++       i_data[EXT3_DIND_BLOCK] = 0;
++     }
++     EXT3_I(inode)->i_cow_bitmap ^= (1UL << EXT3_DIND_BLOCK);
++   }
+ 	case EXT3_DIND_BLOCK:
+-		nr = i_data[EXT3_TIND_BLOCK];
+-		if (nr) {
+-			ext3_free_branches(handle, inode, NULL, &nr, &nr+1, 3);
+-			i_data[EXT3_TIND_BLOCK] = 0;
+-		}
++   if(EXT3_I(inode)->i_cow_bitmap & (1UL << EXT3_TIND_BLOCK)){
++     nr = i_data[EXT3_TIND_BLOCK];
++     if (nr) {
++       ext3_free_branches(handle, inode, NULL, &nr, &nr+1, 3);
++       i_data[EXT3_TIND_BLOCK] = 0;
++     }
++     EXT3_I(inode)->i_cow_bitmap ^= (1UL << EXT3_TIND_BLOCK);
++   }
+ 	case EXT3_TIND_BLOCK:
+ 		;
+ 	}
+@@ -2700,10 +2886,16 @@ void ext3_read_inode(struct inode * inode)
+ 	}
+ 	inode->i_blocks = le32_to_cpu(raw_inode->i_blocks);
+ 	ei->i_flags = le32_to_cpu(raw_inode->i_flags);
++  /* For versioning -znjp */
++  ei->i_cow_bitmap   = le32_to_cpu(raw_inode->i_cowbitmap);
++  ei->i_epoch_number = le32_to_cpu(raw_inode->i_epch_number);
++  ei->i_next_inode   = le32_to_cpu(raw_inode->i_nxt_inode);
++  
+ #ifdef EXT3_FRAGMENTS
+-	ei->i_faddr = le32_to_cpu(raw_inode->i_faddr);
+-	ei->i_frag_no = raw_inode->i_frag;
+-	ei->i_frag_size = raw_inode->i_fsize;
++  /* Taken out for versioning -znjp */
++	//ei->i_faddr = le32_to_cpu(raw_inode->i_faddr);
++	//ei->i_frag_no = raw_inode->i_frag;
++	//ei->i_frag_size = raw_inode->i_fsize;
+ #endif
+ 	ei->i_file_acl = le32_to_cpu(raw_inode->i_file_acl);
+ 	if (!S_ISREG(inode->i_mode)) {
+@@ -2802,13 +2994,16 @@ static int ext3_do_update_inode(handle_t *handle,
+ 		memset(raw_inode, 0, EXT3_SB(inode->i_sb)->s_inode_size);
+ 
+ 	raw_inode->i_mode = cpu_to_le16(inode->i_mode);
++
++
+ 	if(!(test_opt(inode->i_sb, NO_UID32))) {
+ 		raw_inode->i_uid_low = cpu_to_le16(low_16_bits(inode->i_uid));
+ 		raw_inode->i_gid_low = cpu_to_le16(low_16_bits(inode->i_gid));
+-/*
+- * Fix up interoperability with old kernels. Otherwise, old inodes get
+- * re-used with the upper 16 bits of the uid/gid intact
+- */
++    
++    /* Fix up interoperability with old kernels. Otherwise, old inodes get
++     * re-used with the upper 16 bits of the uid/gid intact
++     */
++    
+ 		if(!ei->i_dtime) {
+ 			raw_inode->i_uid_high =
+ 				cpu_to_le16(high_16_bits(inode->i_uid));
+@@ -2818,6 +3013,7 @@ static int ext3_do_update_inode(handle_t *handle,
+ 			raw_inode->i_uid_high = 0;
+ 			raw_inode->i_gid_high = 0;
+ 		}
++    
+ 	} else {
+ 		raw_inode->i_uid_low =
+ 			cpu_to_le16(fs_high2lowuid(inode->i_uid));
+@@ -2826,6 +3022,7 @@ static int ext3_do_update_inode(handle_t *handle,
+ 		raw_inode->i_uid_high = 0;
+ 		raw_inode->i_gid_high = 0;
+ 	}
++ 
+ 	raw_inode->i_links_count = cpu_to_le16(inode->i_nlink);
+ 	raw_inode->i_size = cpu_to_le32(ei->i_disksize);
+ 	raw_inode->i_atime = cpu_to_le32(inode->i_atime.tv_sec);
+@@ -2834,10 +3031,16 @@ static int ext3_do_update_inode(handle_t *handle,
+ 	raw_inode->i_blocks = cpu_to_le32(inode->i_blocks);
+ 	raw_inode->i_dtime = cpu_to_le32(ei->i_dtime);
+ 	raw_inode->i_flags = cpu_to_le32(ei->i_flags);
++  /* For versioning -znjp */
++  raw_inode->i_cowbitmap   = cpu_to_le16(EXT3_I(inode)->i_cow_bitmap);
++  raw_inode->i_epch_number = cpu_to_le32(EXT3_I(inode)->i_epoch_number);
++  raw_inode->i_nxt_inode   = cpu_to_le32(EXT3_I(inode)->i_next_inode);
++
+ #ifdef EXT3_FRAGMENTS
+-	raw_inode->i_faddr = cpu_to_le32(ei->i_faddr);
+-	raw_inode->i_frag = ei->i_frag_no;
+-	raw_inode->i_fsize = ei->i_frag_size;
++  /* Taken out for versioning -znjp */
++	//raw_inode->i_faddr = cpu_to_le32(ei->i_faddr);
++	//raw_inode->i_frag = ei->i_frag_no;
++	//raw_inode->i_fsize = ei->i_frag_size;
+ #endif
+ 	raw_inode->i_file_acl = cpu_to_le32(ei->i_file_acl);
+ 	if (!S_ISREG(inode->i_mode)) {
+@@ -2977,6 +3180,18 @@ int ext3_setattr(struct dentry *dentry, struct iattr *attr)
+ 	if (error)
+ 		return error;
+ 
++  /* For versioning -znjp */
++  if(is_unchangeable(inode, dentry)){
++    error = -EROFS;
++    goto err_out;
++  }
++  
++  if(EXT3_S_EPOCHNUMBER(inode->i_sb) > EXT3_I_EPOCHNUMBER(inode)){
++    error = ext3_dup_inode(dentry->d_parent->d_inode, inode);
++    if(error)
++      goto err_out;
++  }
++  
+ 	if ((ia_valid & ATTR_UID && attr->ia_uid != inode->i_uid) ||
+ 		(ia_valid & ATTR_GID && attr->ia_gid != inode->i_gid)) {
+ 		handle_t *handle;
+@@ -3157,6 +3372,9 @@ int ext3_mark_inode_dirty(handle_t *handle, struct inode *inode)
+ 	struct ext3_iloc iloc;
+ 	int err;
+ 
++  if(EXT3_IS_FAKEINODE(inode))
++    return 0;
++
+ 	might_sleep();
+ 	err = ext3_reserve_inode_write(handle, inode, &iloc);
+ 	if (!err)
+diff --git a/ext3/ioctl.c b/ext3co/ioctl.c
+index 9b8090d..1bd9aa2 100644
+--- a/ext3/ioctl.c
++++ b/ext3co/ioctl.c
+@@ -27,6 +27,11 @@ int ext3_ioctl (struct inode * inode, struct file * filp, unsigned int cmd,
+ 	ext3_debug ("cmd = %u, arg = %lu\n", cmd, arg);
+ 
+ 	switch (cmd) {
++    /* Some IOCTLs for version */
++   case EXT3_IOC_TAKESNAPSHOT:
++    return (unsigned int)ext3_take_snapshot(inode->i_sb);
++   case EXT3_IOC_GETEPOCH:
++    return (unsigned int)EXT3_S_EPOCHNUMBER(inode->i_sb);
+ 	case EXT3_IOC_GETFLAGS:
+ 		flags = ei->i_flags & EXT3_FL_USER_VISIBLE;
+ 		return put_user(flags, (int __user *) arg);
+diff --git a/ext3/namei.c b/ext3co/namei.c
+index 4df39c4..ee0f35a 100644
+--- a/ext3/namei.c
++++ b/ext3co/namei.c
+@@ -50,6 +50,22 @@
+ #define NAMEI_RA_SIZE        (NAMEI_RA_CHUNKS * NAMEI_RA_BLOCKS)
+ #define NAMEI_RA_INDEX(c,b)  (((c) * NAMEI_RA_BLOCKS) + (b))
+ 
++/* is the inode marked unchangeable or does the name
++   contain an epoch less than the current system epoch -znjp */
++int is_unchangeable(struct inode *inode, struct dentry *dentry){
++  
++  char *at = NULL;
++
++  if (inode && (EXT3_IS_UNCHANGEABLE(inode) || IS_IMMUTABLE(inode)))
++    return 1;
++  if(dentry)
++    at = strrchr(dentry->d_name.name, EXT3_FLUX_TOKEN);
++  if(at && (simple_strtol(&at[1], (char **)NULL, 10) > 0))
++    return 1;
++
++  return 0;
++}
++
+ static struct buffer_head *ext3_append(handle_t *handle,
+ 					struct inode *inode,
+ 					u32 *block, int *err)
+@@ -765,6 +781,9 @@ static inline int ext3_match (int len, const char * const name,
+ /*
+  * Returns 0 if not found, -1 on failure, and 1 on success
+  */
++/* For versioning - this is the function used when looking for
++ * names.  We now handle names which include the flux token,
++ * strip it off and continue looking -znjp */
+ static inline int search_dirblock(struct buffer_head * bh,
+ 				  struct inode *dir,
+ 				  struct dentry *dentry,
+@@ -772,10 +791,37 @@ static inline int search_dirblock(struct buffer_head * bh,
+ 				  struct ext3_dir_entry_2 ** res_dir)
+ {
+ 	struct ext3_dir_entry_2 * de;
+-	char * dlimit;
++	char * dlimit, * flux = NULL;
+ 	int de_len;
+-	const char *name = dentry->d_name.name;
++	char name[EXT3_NAME_LEN];
+ 	int namelen = dentry->d_name.len;
++  unsigned int epoch_number = EXT3_I_EPOCHNUMBER(dir);
++
++  /* Get the name for the dentry */
++  memcpy(name, dentry->d_name.name, namelen);
++  name[namelen] = '\0';
++
++  /* Check to see if the flux token is in the name */
++  flux = strrchr(dentry->d_name.name, EXT3_FLUX_TOKEN);
++  if(NULL != flux){
++    /* If we're here, the name we want is in the past. */
++    int new_namelen = strlen(dentry->d_name.name) - strlen(flux);
++    /* Get the epoch number */
++    epoch_number = simple_strtol(&flux[1], (char **)NULL, 10) - 1;
++    /* If there's a valid epoch number or if we're version listing
++     * we need the name seperately, otherwise the FLUX_TOKEN exists
++     * in the file name */
++    if(epoch_number + 1 == 0 && (strlen(flux) > 1)){ 
++      /* EXT3_FLUX_TOKEN exists in the file name */
++      epoch_number = EXT3_S_EPOCHNUMBER(dir->i_sb);
++    }else{
++      /* Grab the correct name and length */
++      memcpy(name, dentry->d_name.name, new_namelen);
++      name[new_namelen] = '\0';
++      namelen = strlen(name);
++    }
++  }
++
+ 
+ 	de = (struct ext3_dir_entry_2 *) bh->b_data;
+ 	dlimit = bh->b_data + dir->i_sb->s_blocksize;
+@@ -783,8 +829,12 @@ static inline int search_dirblock(struct buffer_head * bh,
+ 		/* this code is executed quadratically often */
+ 		/* do minimal checking `by hand' */
+ 
++    /* Can't just return first entry of something;
++     * may exist twice if died and same name appears again. - znjp
++     */
+ 		if ((char *) de + namelen <= dlimit &&
+-		    ext3_match (namelen, name, de)) {
++		    ext3_match (namelen, name, de) && 
++        EXT3_IS_DIRENT_SCOPED(de, epoch_number)) {
+ 			/* found a match - just to be sure, do a full check */
+ 			if (!ext3_check_dir_entry("ext3_find_entry",
+ 						  dir, de, bh, offset))
+@@ -996,17 +1046,37 @@ errout:
+ }
+ #endif
+ 
+-static struct dentry *ext3_lookup(struct inode * dir, struct dentry *dentry, struct nameidata *nd)
++/* ext3_lookup: One the key functions of this versioning file sytem,
++ * allowing people to return to the past.
++ *
++ * Two policies for inode chains:
++ * 1) If it's the head of the list, it's the most current inode
++ *    and always changable.  The inode number is static.
++ * 2) If it's any inode in the chain that's not the head,
++ *    than it's an inode in the past and unchangeable.  The inode
++ *    number may change.
++ */
++static struct dentry *ext3_lookup(struct inode * dir, struct dentry *dentry,
++                                     struct nameidata *nd)
+ {
+-	struct inode * inode;
+-	struct ext3_dir_entry_2 * de;
+-	struct buffer_head * bh;
+-
++	struct inode * inode = NULL;
++	struct ext3_dir_entry_2 * de = NULL;
++	struct buffer_head * bh = NULL;
++  unsigned int epoch_number = 0;
++  char * flux = NULL;
++  
+ 	if (dentry->d_name.len > EXT3_NAME_LEN)
+ 		return ERR_PTR(-ENAMETOOLONG);
+ 
++  /* Find the epoch number to scope with -znjp 
++   * if the parent is unchangeable, so is the inode 
++   */
++  if(EXT3_IS_UNCHANGEABLE(dir))     
++    epoch_number = EXT3_I_EPOCHNUMBER(dir);
++  else
++    epoch_number = EXT3_S_EPOCHNUMBER(dir->i_sb);
++
+ 	bh = ext3_find_entry(dentry, &de);
+-	inode = NULL;
+ 	if (bh) {
+ 		unsigned long ino = le32_to_cpu(de->inode);
+ 		brelse (bh);
+@@ -1019,6 +1089,87 @@ static struct dentry *ext3_lookup(struct inode * dir, struct dentry *dentry, str
+ 
+ 		if (!inode)
+ 			return ERR_PTR(-EACCES);
++
++    /* Is this a version listing ? */
++    if ((char)dentry->d_name.name[dentry->d_name.len - 1] == 
++        EXT3_FLUX_TOKEN) {
++      /* prevent going round in circles */
++      if (dentry->d_parent && 
++          dentry->d_parent->d_name.name[dentry->d_parent->d_name.len - 1] ==
++          EXT3_FLUX_TOKEN) {
++        return NULL;
++      }
++      /* we fake a directory using the directory inode instead of
++       * the file one and subsequently force a call to ext3_readdir */
++      iput(inode);
++      inode = ext3_fake_inode(dir, EXT3_S_EPOCHNUMBER(dir->i_sb));
++      EXT3_I(inode)->i_next_inode = EXT3_I(dir)->i_next_inode;
++      d_splice_alias(inode, dentry);
++      
++      return NULL;
++    }
++
++    /* Is the user time-shifting to the past? */
++    flux = strrchr(dentry->d_name.name, EXT3_FLUX_TOKEN);
++    if(NULL != flux){
++
++      if(strnicmp(&flux[1], "onehour", 8) == 0){
++        epoch_number = get_seconds() - ONEHOUR;
++        printk(KERN_INFO "ONEHOUR!\n");
++      }else if(strnicmp(&flux[1], "yesterday", 10) == 0 ||
++               strnicmp(&flux[1], "oneday", 7) == 0){
++        epoch_number = get_seconds() - YESTERDAY;
++      }else if(strnicmp(&flux[1], "oneweek", 8) == 0){
++        epoch_number = get_seconds() - ONEWEEK;
++      }else if(strnicmp(&flux[1], "onemonth", 9) == 0){
++        epoch_number = get_seconds() - ONEMONTH;
++      }else if(strnicmp(&flux[1], "oneyear", 8) == 0){
++        epoch_number = get_seconds() - ONEYEAR;
++      }else
++        epoch_number = simple_strtol(&flux[1], (char **)NULL, 10) - 1;
++
++      /* No future epochs */
++      if(epoch_number + 1 > EXT3_S_EPOCHNUMBER(dir->i_sb))                
++        return ERR_PTR(-ENOENT); 
++
++      /* Move to present 
++      if(epoch_number + 1 == 0)
++        epoch_number = EXT3_S_EPOCHNUMBER(dir->i_sb);       
++      */
++    }
++     
++    /* Find correct inode in chain */
++    while(EXT3_I_EPOCHNUMBER(inode) > epoch_number){
++
++      printk(KERN_INFO "Looking for %u with epoch %u\n", epoch_number, 
++             EXT3_I_EPOCHNUMBER(inode));
++
++      ino = EXT3_I(inode)->i_next_inode;
++      if(ino == 0){
++        ext3_warning(dir->i_sb, "ext3_lookup",
++                        "Next inode is 0 in lookup.");
++        iput(inode);
++        return ERR_PTR(-ENOENT);
++      }
++      iput(inode); /* for correct usage count (i_count) */
++      inode = iget(dir->i_sb, ino);
++      
++      if (!inode){
++        ext3_warning(dir->i_sb, "ext3_lookup",
++                        "Could not access inode number %lu",
++                        ino);
++        return ERR_PTR(-EACCES);
++      }
++    }
++
++    /* If we're in the past, fake the inode for scoping and "unchangability" */
++    if(flux || (epoch_number != EXT3_S_EPOCHNUMBER(dir->i_sb))){
++      printk(KERN_INFO "Faking %s\n", dentry->d_name.name);
++      inode = ext3_fake_inode(inode, epoch_number);
++    }
++
++    if (!inode)
++      return ERR_PTR(-EACCES);
+ 	}
+ 	return d_splice_alias(inode, dentry);
+ }
+@@ -1232,9 +1383,12 @@ static int add_dirent_to_buf(handle_t *handle, struct dentry *dentry,
+ 			if (!ext3_check_dir_entry("ext3_add_entry", dir, de,
+ 						  bh, offset)) {
+ 				brelse (bh);
++        ext3_reclaim_dup_inode(dentry->d_parent->d_parent->d_inode, dir);
+ 				return -EIO;
+ 			}
+-			if (ext3_match (namelen, name, de)) {
++      /* If name exists and it's still alive, no add. But if it's a new
++       * name in this scope, ok to add. -znjp */
++			if (ext3_match (namelen, name, de) && EXT3_IS_DIRENT_ALIVE(de)) {
+ 				brelse (bh);
+ 				return -EEXIST;
+ 			}
+@@ -1271,6 +1425,9 @@ static int add_dirent_to_buf(handle_t *handle, struct dentry *dentry,
+ 		ext3_set_de_type(dir->i_sb, de, inode->i_mode);
+ 	} else
+ 		de->inode = 0;
++  /* For versioning -znjp */
++  de->birth_epoch = cpu_to_le32(EXT3_S_EPOCHNUMBER(dir->i_sb));
++  de->death_epoch = cpu_to_le32(EXT3_DIRENT_ALIVE);
+ 	de->name_len = namelen;
+ 	memcpy (de->name, name, namelen);
+ 	/*
+@@ -1406,11 +1563,22 @@ static int ext3_add_entry (handle_t *handle, struct dentry *dentry,
+ 	blocksize = sb->s_blocksize;
+ 	if (!dentry->d_name.len)
+ 		return -EINVAL;
++  /* No additions in the past -znjp */
++  if(is_unchangeable(dir, dentry))
++    return -EROFS;
++
++  if(EXT3_S_EPOCHNUMBER(sb) > EXT3_I_EPOCHNUMBER(dir)){   
++    if(ext3_dup_inode(dentry->d_parent->d_parent->d_inode, dir))
++      return -1;
++  }
++
+ #ifdef CONFIG_EXT3_INDEX
+ 	if (is_dx(dir)) {
+ 		retval = ext3_dx_add_entry(handle, dentry, inode);
+-		if (!retval || (retval != ERR_BAD_DX_DIR))
++		if (!retval || (retval != ERR_BAD_DX_DIR)){
++      ext3_reclaim_dup_inode(dentry->d_parent->d_parent->d_inode, dir);
+ 			return retval;
++    }
+ 		EXT3_I(dir)->i_flags &= ~EXT3_INDEX_FL;
+ 		dx_fallback++;
+ 		ext3_mark_inode_dirty(handle, dir);
+@@ -1419,8 +1587,10 @@ static int ext3_add_entry (handle_t *handle, struct dentry *dentry,
+ 	blocks = dir->i_size >> sb->s_blocksize_bits;
+ 	for (block = 0, offset = 0; block < blocks; block++) {
+ 		bh = ext3_bread(handle, dir, block, 0, &retval);
+-		if(!bh)
++		if(!bh){
++      ext3_reclaim_dup_inode(dentry->d_parent->d_parent->d_inode, dir);
+ 			return retval;
++    }
+ 		retval = add_dirent_to_buf(handle, dentry, inode, NULL, bh);
+ 		if (retval != -ENOSPC)
+ 			return retval;
+@@ -1432,9 +1602,12 @@ static int ext3_add_entry (handle_t *handle, struct dentry *dentry,
+ #endif
+ 		brelse(bh);
+ 	}
++
+ 	bh = ext3_append(handle, dir, &block, &retval);
+-	if (!bh)
++	if (!bh){
++    ext3_reclaim_dup_inode(dentry->d_parent->d_parent->d_inode, dir);
+ 		return retval;
++  }
+ 	de = (struct ext3_dir_entry_2 *) bh->b_data;
+ 	de->inode = 0;
+ 	de->rec_len = cpu_to_le16(blocksize);
+@@ -1583,9 +1756,10 @@ cleanup:
+  * previous entry
+  */
+ static int ext3_delete_entry (handle_t *handle,
+-			      struct inode * dir,
+-			      struct ext3_dir_entry_2 * de_del,
+-			      struct buffer_head * bh)
++                                 struct inode * dir,
++                                 struct ext3_dir_entry_2 * de_del,
++                                 struct buffer_head * bh,
++                                 struct dentry *dentry)
+ {
+ 	struct ext3_dir_entry_2 * de, * pde;
+ 	int i;
+@@ -1597,14 +1771,28 @@ static int ext3_delete_entry (handle_t *handle,
+ 		if (!ext3_check_dir_entry("ext3_delete_entry", dir, de, bh, i))
+ 			return -EIO;
+ 		if (de == de_del)  {
++      /* Can't delete an already dead entry - znjp */
++      if(!EXT3_IS_DIRENT_ALIVE(de))
++        return 0;
++      
++      if(EXT3_S_EPOCHNUMBER(dir->i_sb) > EXT3_I_EPOCHNUMBER(dir)){
++        if(ext3_dup_inode(dentry->d_parent->d_parent->d_inode, dir))
++          return -1;
++      }
++
+ 			BUFFER_TRACE(bh, "get_write_access");
+ 			ext3_journal_get_write_access(handle, bh);
++      /* There used to be code here to adjust the rec_len
++       * but since names really never go away, the code was deleted 
+ 			if (pde)
+ 				pde->rec_len =
+ 					cpu_to_le16(le16_to_cpu(pde->rec_len) +
+ 						    le16_to_cpu(de->rec_len));
+ 			else
+ 				de->inode = 0;
++      */
++      /* Mark it dead - znjp */
++      de->death_epoch = cpu_to_le32(EXT3_I_EPOCHNUMBER(dir));
+ 			dir->i_version++;
+ 			BUFFER_TRACE(bh, "call ext3_journal_dirty_metadata");
+ 			ext3_journal_dirty_metadata(handle, bh);
+@@ -1662,6 +1850,10 @@ static int ext3_create (struct inode * dir, struct dentry * dentry, int mode,
+ 	struct inode * inode;
+ 	int err, retries = 0;
+ 
++  /* Can't create in the past -znjp */
++  if(is_unchangeable(dir, dentry))
++    return -EROFS;
++
+ retry:
+ 	handle = ext3_journal_start(dir, EXT3_DATA_TRANS_BLOCKS(dir->i_sb) +
+ 					EXT3_INDEX_EXTRA_TRANS_BLOCKS + 3 +
+@@ -1731,6 +1923,10 @@ static int ext3_mkdir(struct inode * dir, struct dentry * dentry, int mode)
+ 
+ 	if (dir->i_nlink >= EXT3_LINK_MAX)
+ 		return -EMLINK;
++  /* No mkdirs in the past -znjp */
++  if(is_unchangeable(dir, dentry))
++    return -EROFS;
++
+ 
+ retry:
+ 	handle = ext3_journal_start(dir, EXT3_DATA_TRANS_BLOCKS(dir->i_sb) +
+@@ -1763,6 +1959,9 @@ retry:
+ 	de->inode = cpu_to_le32(inode->i_ino);
+ 	de->name_len = 1;
+ 	de->rec_len = cpu_to_le16(EXT3_DIR_REC_LEN(de->name_len));
++  /* For versioning -znjp */
++  de->birth_epoch = cpu_to_le32(EXT3_S_EPOCHNUMBER(dir->i_sb));
++  de->death_epoch = cpu_to_le32(EXT3_DIRENT_ALIVE);
+ 	strcpy (de->name, ".");
+ 	ext3_set_de_type(dir->i_sb, de, S_IFDIR);
+ 	de = (struct ext3_dir_entry_2 *)
+@@ -1773,6 +1972,9 @@ retry:
+ 	strcpy (de->name, "..");
+ 	ext3_set_de_type(dir->i_sb, de, S_IFDIR);
+ 	inode->i_nlink = 2;
++  /* For versioning -znjp */
++  de->birth_epoch = cpu_to_le32(EXT3_I_EPOCHNUMBER(dir)); 
++  de->death_epoch = cpu_to_le32(EXT3_DIRENT_ALIVE);
+ 	BUFFER_TRACE(dir_block, "call ext3_journal_dirty_metadata");
+ 	ext3_journal_dirty_metadata(handle, dir_block);
+ 	brelse (dir_block);
+@@ -1859,7 +2061,9 @@ static int empty_dir (struct inode * inode)
+ 			offset = (offset | (sb->s_blocksize - 1)) + 1;
+ 			continue;
+ 		}
+-		if (le32_to_cpu(de->inode)) {
++    /* Can remove a dir only if all dirents are out of scope -znjp */
++		if (le32_to_cpu(de->inode) &&
++        EXT3_IS_DIRENT_SCOPED(de, EXT3_I_EPOCHNUMBER(inode))) {
+ 			brelse (bh);
+ 			return 0;
+ 		}
+@@ -2038,6 +2242,11 @@ static int ext3_rmdir (struct inode * dir, struct dentry *dentry)
+ 
+ 	inode = dentry->d_inode;
+ 
++  /* Can't rmdir in the past -znjp */
++  retval = -EROFS;
++  if(is_unchangeable(inode, dentry))
++    goto end_rmdir;
++
+ 	retval = -EIO;
+ 	if (le32_to_cpu(de->inode) != inode->i_ino)
+ 		goto end_rmdir;
+@@ -2046,7 +2255,7 @@ static int ext3_rmdir (struct inode * dir, struct dentry *dentry)
+ 	if (!empty_dir (inode))
+ 		goto end_rmdir;
+ 
+-	retval = ext3_delete_entry(handle, dir, de, bh);
++	retval = ext3_delete_entry(handle, dir, de, bh, dentry);
+ 	if (retval)
+ 		goto end_rmdir;
+ 	if (inode->i_nlink != 2)
+@@ -2054,16 +2263,21 @@ static int ext3_rmdir (struct inode * dir, struct dentry *dentry)
+ 			      "empty directory has nlink!=2 (%d)",
+ 			      inode->i_nlink);
+ 	inode->i_version++;
+-	clear_nlink(inode);
+-	/* There's no need to set i_disksize: the fact that i_nlink is
+-	 * zero will ensure that the right thing happens during any
+-	 * recovery. */
+-	inode->i_size = 0;
+-	ext3_orphan_add(handle, inode);
+-	inode->i_ctime = dir->i_ctime = dir->i_mtime = CURRENT_TIME_SEC;
+-	ext3_mark_inode_dirty(handle, inode);
+-	drop_nlink(dir);
+-	ext3_update_dx_flag(dir);
++
++  /* We only delete things that were created in the same epoch -znjp */
++  if(de->birth_epoch == de->death_epoch){
++    clear_nlink(inode);
++    /* There's no need to set i_disksize: the fact that i_nlink is
++     * zero will ensure that the right thing happens during any
++     * recovery. */
++    inode->i_size = 0;
++    ext3_orphan_add(handle, inode);
++    drop_nlink(dir);
++  }
++  EXT3_I(inode)->i_flags |= EXT3_UNCHANGEABLE_FL;
++  inode->i_ctime = dir->i_ctime = dir->i_mtime = CURRENT_TIME_SEC;
++  ext3_mark_inode_dirty(handle, inode);
++  ext3_update_dx_flag(dir);
+ 	ext3_mark_inode_dirty(handle, dir);
+ 
+ end_rmdir:
+@@ -2097,6 +2311,11 @@ static int ext3_unlink(struct inode * dir, struct dentry *dentry)
+ 
+ 	inode = dentry->d_inode;
+ 
++  /* Can't unlink in the past -znjp */
++  retval = -EROFS;
++  if(is_unchangeable(inode, dentry))
++    goto end_unlink;  
++  
+ 	retval = -EIO;
+ 	if (le32_to_cpu(de->inode) != inode->i_ino)
+ 		goto end_unlink;
+@@ -2107,15 +2326,27 @@ static int ext3_unlink(struct inode * dir, struct dentry *dentry)
+ 			      inode->i_ino, inode->i_nlink);
+ 		inode->i_nlink = 1;
+ 	}
+-	retval = ext3_delete_entry(handle, dir, de, bh);
++	retval = ext3_delete_entry(handle, dir, de, bh, dentry);
+ 	if (retval)
+ 		goto end_unlink;
+ 	dir->i_ctime = dir->i_mtime = CURRENT_TIME_SEC;
+ 	ext3_update_dx_flag(dir);
+ 	ext3_mark_inode_dirty(handle, dir);
+-	drop_nlink(inode);
+-	if (!inode->i_nlink)
+-		ext3_orphan_add(handle, inode);
++
++  /* If the file should be deleted here, don't actually delete it
++   * but mark it unchangeable, i.e. it's now in the past. -znjp */
++
++  /* If file was created in this epoch, then we actually unlink it,
++   * if not, then it belongs to the past, so mark it unchangeable -znjp */
++  if(de->birth_epoch == de->death_epoch){
++  	drop_nlink(inode);
++    if (!inode->i_nlink){
++      ext3_orphan_add(handle, inode);
++    }
++  }else{
++    if(!(inode->i_nlink - 1))
++      EXT3_I(inode)->i_flags |= EXT3_UNCHANGEABLE_FL; 
++  }
+ 	inode->i_ctime = dir->i_ctime;
+ 	ext3_mark_inode_dirty(handle, inode);
+ 	retval = 0;
+@@ -2236,8 +2467,8 @@ static int ext3_rename (struct inode * old_dir, struct dentry *old_dentry,
+ 	if (new_dentry->d_inode)
+ 		DQUOT_INIT(new_dentry->d_inode);
+ 	handle = ext3_journal_start(old_dir, 2 *
+-					EXT3_DATA_TRANS_BLOCKS(old_dir->i_sb) +
+-					EXT3_INDEX_EXTRA_TRANS_BLOCKS + 2);
++                                 EXT3_DATA_TRANS_BLOCKS(old_dir->i_sb) +
++                                 EXT3_INDEX_EXTRA_TRANS_BLOCKS + 2);
+ 	if (IS_ERR(handle))
+ 		return PTR_ERR(handle);
+ 
+@@ -2264,6 +2495,15 @@ static int ext3_rename (struct inode * old_dir, struct dentry *old_dentry,
+ 			new_bh = NULL;
+ 		}
+ 	}
++
++  /* can't move something into the past -znjp */
++  retval = -EROFS;
++  if(is_unchangeable(new_inode, new_dentry)) 
++    goto end_rename;
++  /* can't some move from the past -znjp */
++  if(is_unchangeable(old_inode, old_dentry))
++    goto end_rename;
++
+ 	if (S_ISDIR(old_inode->i_mode)) {
+ 		if (new_inode) {
+ 			retval = -ENOTEMPTY;
+@@ -2313,7 +2553,7 @@ static int ext3_rename (struct inode * old_dir, struct dentry *old_dentry,
+ 	    old_de->name_len != old_dentry->d_name.len ||
+ 	    strncmp(old_de->name, old_dentry->d_name.name, old_de->name_len) ||
+ 	    (retval = ext3_delete_entry(handle, old_dir,
+-					old_de, old_bh)) == -ENOENT) {
++                                     old_de, old_bh, new_dentry)) == -ENOENT) {
+ 		/* old_de could have moved from under us during htree split, so
+ 		 * make sure that we are deleting the right entry.  We might
+ 		 * also be pointing to a stale entry in the unused part of
+@@ -2324,7 +2564,7 @@ static int ext3_rename (struct inode * old_dir, struct dentry *old_dentry,
+ 		old_bh2 = ext3_find_entry(old_dentry, &old_de2);
+ 		if (old_bh2) {
+ 			retval = ext3_delete_entry(handle, old_dir,
+-						   old_de2, old_bh2);
++                                    old_de2, old_bh2, new_dentry);
+ 			brelse(old_bh2);
+ 		}
+ 	}
+@@ -2335,10 +2575,10 @@ static int ext3_rename (struct inode * old_dir, struct dentry *old_dentry,
+ 	}
+ 
+ 	if (new_inode) {
+-		drop_nlink(new_inode);
+ 		new_inode->i_ctime = CURRENT_TIME_SEC;
+ 	}
+-	old_dir->i_ctime = old_dir->i_mtime = CURRENT_TIME_SEC;
++  if(!is_unchangeable(old_inode, old_dentry))
++    old_dir->i_ctime = old_dir->i_mtime = CURRENT_TIME_SEC;
+ 	ext3_update_dx_flag(old_dir);
+ 	if (dir_bh) {
+ 		BUFFER_TRACE(dir_bh, "get_write_access");
+@@ -2346,10 +2586,7 @@ static int ext3_rename (struct inode * old_dir, struct dentry *old_dentry,
+ 		PARENT_INO(dir_bh->b_data) = cpu_to_le32(new_dir->i_ino);
+ 		BUFFER_TRACE(dir_bh, "call ext3_journal_dirty_metadata");
+ 		ext3_journal_dirty_metadata(handle, dir_bh);
+-		drop_nlink(old_dir);
+-		if (new_inode) {
+-			drop_nlink(new_inode);
+-		} else {
++		if (!new_inode) {
+ 			inc_nlink(new_dir);
+ 			ext3_update_dx_flag(new_dir);
+ 			ext3_mark_inode_dirty(handle, new_dir);
+@@ -2371,6 +2608,342 @@ end_rename:
+ 	return retval;
+ }
+ 
++/* ext3_fake_inode: This function creates a VFS-only inode
++ * used for properly scoping views into the past file system - znjp
++ */
++struct inode *ext3_fake_inode(struct inode *inode,
++                                 unsigned int epoch_number)
++{
++  struct inode * fake_inode = NULL;
++  struct ext3_inode_info * ini = NULL;
++  struct ext3_inode_info * fake_ini = NULL;
++  static unsigned int last_ino = UINT_MAX;
++  int err = 0;
++  int block = -1;
++
++  if(NULL == inode){
++    printk(KERN_ERR "Trying to duplicate a NULL inode.\n");
++    return NULL;
++  }
++
++  if(EXT3_IS_FAKEINODE(inode)){
++    printk(KERN_ERR "Trying to fake a fake inode.\n");
++    return inode;
++  }
++
++  printk(KERN_INFO "** faking inode %lu\n", inode->i_ino);
++
++  ini = EXT3_I(inode);
++  
++  /* Create a new VFS-only inode */
++  fake_inode = new_inode(inode->i_sb);   
++  err = PTR_ERR(fake_inode);
++  if(!IS_ERR(fake_inode)){
++
++    fake_ini = EXT3_I(fake_inode);
++
++    printk(KERN_INFO "** got inode %lu setting with %u\n", fake_inode->i_ino,
++           last_ino);
++
++    /* When inode is a directory, we can fake the inode number */
++    //if(S_ISDIR(inode->i_mode))
++    fake_inode->i_ino  = --last_ino;
++
++    fake_inode->i_mode = inode->i_mode;
++    fake_inode->i_uid  = inode->i_uid;
++    fake_inode->i_gid  = inode->i_gid;
++
++    atomic_set(&fake_inode->i_count, 1);
++
++    fake_inode->i_nlink         = inode->i_nlink;
++    fake_inode->i_size          = inode->i_size;
++    fake_inode->i_atime.tv_sec  = inode->i_atime.tv_sec;
++    fake_inode->i_ctime.tv_sec  = inode->i_ctime.tv_sec;
++    fake_inode->i_mtime.tv_sec  = inode->i_mtime.tv_sec;
++    fake_inode->i_atime.tv_nsec = inode->i_atime.tv_nsec;
++    fake_inode->i_ctime.tv_nsec = inode->i_ctime.tv_nsec;
++    fake_inode->i_mtime.tv_nsec = inode->i_mtime.tv_nsec;
++
++    fake_ini->i_state = ini->i_state;
++    fake_ini->i_dir_start_lookup = ini->i_dir_start_lookup;
++    fake_ini->i_dtime = ini->i_dtime;
++
++    fake_inode->i_blocks  = inode->i_blocks;
++    fake_ini->i_flags     = ini->i_flags;
++#ifdef EXT3_FRAGMENTS
++    /* Taken out for versioning -znjp */
++    //fake_ini->i_faddr     = ini->i_faddr;
++    //fake_ini->i_frag_no   = ini->i_frag_no;
++    //fake_ini->i_frag_size = ini->i_frag_size;
++#endif
++    fake_ini->i_file_acl = ini->i_file_acl;
++    if (!S_ISREG(fake_inode->i_mode)) {
++      fake_ini->i_dir_acl = ini->i_dir_acl;
++    } 
++    fake_ini->i_disksize = inode->i_size;
++    fake_inode->i_generation = inode->i_generation;
++    //TODO: This could be wrong.
++    //fake_ini->i_block_group = ini->i_block_group; //iloc.block_group;
++
++    for (block = 0; block < EXT3_N_BLOCKS; block++)
++      fake_ini->i_data[block] = ini->i_data[block];
++
++    fake_ini->i_extra_isize = ini->i_extra_isize;
++
++    /* set copy-on-write bitmap to 0 */
++    fake_ini->i_cow_bitmap = 0x0000;
++    
++    /* Mark fake inode unchangeable, etc. */
++    fake_ini->i_flags |= EXT3_UNCHANGEABLE_FL;
++    fake_ini->i_flags |= EXT3_UNVERSIONABLE_FL;
++    fake_ini->i_flags |= EXT3_FAKEINODE_FL;
++    fake_ini->i_flags |= EXT3_IMMUTABLE_FL;
++
++    /* Make sure we get the right operations */
++    if (S_ISREG(fake_inode->i_mode)) {
++      fake_inode->i_op = &ext3_file_inode_operations;
++      fake_inode->i_fop = &ext3_file_operations;
++      ext3_set_aops(fake_inode);
++    } else if (S_ISDIR(fake_inode->i_mode)) {
++      fake_inode->i_op = &ext3_dir_inode_operations;
++      fake_inode->i_fop = &ext3_dir_operations;
++    } else if (S_ISLNK(fake_inode->i_mode)) {
++      //if (ext3_inode_is_fast_symlink(cow_inode))
++      if((S_ISLNK(fake_inode->i_mode) && fake_inode->i_blocks - 
++          (EXT3_I(fake_inode)->i_file_acl ? 
++           (fake_inode->i_sb->s_blocksize >> 9) : 0)))
++        fake_inode->i_op = &ext3_fast_symlink_inode_operations;
++      else {
++        fake_inode->i_op = &ext3_symlink_inode_operations;
++        ext3_set_aops(fake_inode);
++      }
++    } else {
++      fake_inode->i_op = &ext3_special_inode_operations;
++    }
++
++    fake_ini->i_epoch_number = epoch_number;
++    fake_ini->i_next_inode = 0;
++    
++    iput(inode); /* dec i_count */
++
++    return fake_inode;
++  }else
++    ext3_warning(inode->i_sb, "ext3_fake_inode",
++                    "Could not create fake inode.");
++   
++ 	return NULL;
++}
++
++/* 
++ * ext3_dup_inode: This function creates a new inode, 
++ * copies all the metadata from the passed in inode,  
++ * and adds it to the version chain, creating a new version.  
++ * The head of the chain never changes; it is always the most current version.
++ * Similar in nature to ext3_creat and ext3_read_inode. -znjp
++ */
++int ext3_dup_inode(struct inode *dir, struct inode *inode){
++
++  struct inode *cow_inode = NULL;
++  struct inode *parent = NULL;
++  struct ext3_inode_info *ini = NULL;
++  struct ext3_inode_info *cow_ini = NULL;
++  handle_t *handle = NULL;
++  int err = 0;
++  int block = -1;
++  unsigned int epoch_number_temp = 0;
++  int retries = 0;
++
++  printk(KERN_INFO "** duping inode %lu\n", inode->i_ino);
++
++  if(EXT3_IS_UNVERSIONABLE(inode))
++    return 0;
++
++  if(NULL == inode){
++    printk(KERN_ERR "Trying to duplicate a NULL inode.\n");
++    return -1;
++  }
++
++	if (inode->i_nlink == 0) {
++		if (inode->i_mode == 0 ||
++		    !(EXT3_SB(inode->i_sb)->s_mount_state & EXT3_ORPHAN_FS)) {
++			/* this inode is deleted */
++      return -1;
++		}
++		/* The only unlinked inodes we let through here have
++		 * valid i_mode and are being read by the orphan
++		 * recovery code: that's fine, we're about to complete
++		 * the process of deleting those. */
++	}
++
++  ini = EXT3_I(inode);
++
++  /* This is for truncate, which can't pass in a parent */
++  if(NULL == dir)
++    parent = inode;
++  else
++    parent = dir;
++
++ retry:
++	handle = ext3_journal_start(parent, EXT3_DATA_TRANS_BLOCKS(dir->i_sb) +
++					EXT3_INDEX_EXTRA_TRANS_BLOCKS + 3 +
++					2*EXT3_QUOTA_INIT_BLOCKS(dir->i_sb));
++	if (IS_ERR(handle))
++		return PTR_ERR(handle);
++
++	if (IS_DIRSYNC(parent))
++		handle->h_sync = 1;
++
++	cow_inode = ext3_new_inode (handle, parent, inode->i_mode);
++	err = PTR_ERR(cow_inode);
++	if (!IS_ERR(cow_inode)) {
++
++    printk(KERN_INFO "  ** Allocated new inode %lu\n", cow_inode->i_ino);
++
++    cow_ini = EXT3_I(cow_inode);
++    
++    cow_inode->i_mode = inode->i_mode;
++    cow_inode->i_uid  = inode->i_uid;
++    cow_inode->i_gid  = inode->i_gid;
++
++    cow_inode->i_nlink         = inode->i_nlink;
++    cow_inode->i_size          = inode->i_size;
++    cow_inode->i_atime.tv_sec  = inode->i_atime.tv_sec;
++    cow_inode->i_ctime.tv_sec  = inode->i_ctime.tv_sec;
++    cow_inode->i_mtime.tv_sec  = inode->i_mtime.tv_sec;
++    cow_inode->i_atime.tv_nsec = inode->i_atime.tv_nsec;
++    cow_inode->i_ctime.tv_nsec = inode->i_ctime.tv_nsec;
++    cow_inode->i_mtime.tv_nsec = inode->i_mtime.tv_nsec;
++
++    cow_ini->i_state = ini->i_state;
++    cow_ini->i_dir_start_lookup = ini->i_dir_start_lookup;
++    cow_ini->i_dtime = ini->i_dtime;
++
++    cow_inode->i_blocks  = inode->i_blocks;
++    cow_ini->i_flags     = ini->i_flags;
++#ifdef EXT3_FRAGMENTS
++    /* Taken out for versioning -znjp */
++    //cow_ini->i_faddr     = ini->i_faddr;
++    //cow_ini->i_frag_no   = ini->i_frag_no;
++    //cow_ini->i_frag_size = ini->i_frag_size;
++#endif
++    cow_ini->i_file_acl = ini->i_file_acl;
++    if (!S_ISREG(cow_inode->i_mode)) {
++      cow_ini->i_dir_acl = ini->i_dir_acl;
++    } 
++    cow_ini->i_disksize = inode->i_size;
++    cow_inode->i_generation = inode->i_generation;
++    //TODO: This could be wrong.
++    cow_ini->i_block_group = ini->i_block_group; //iloc.block_group;
++
++    for (block = 0; block < EXT3_N_BLOCKS; block++)
++      cow_ini->i_data[block] = ini->i_data[block];
++
++    //TODO: This could be wrong
++    //cow_ini->i_orphan = NULL; //INIT_LIST_HEAD(&ei->i_orphan);
++   
++    cow_ini->i_extra_isize = ini->i_extra_isize;
++
++    /* Make sure we get the right operations */
++    if (S_ISREG(cow_inode->i_mode)) {
++      cow_inode->i_op = &ext3_file_inode_operations;
++      cow_inode->i_fop = &ext3_file_operations;
++      ext3_set_aops(cow_inode);
++    } else if (S_ISDIR(cow_inode->i_mode)) {
++      cow_inode->i_op = &ext3_dir_inode_operations;
++      cow_inode->i_fop = &ext3_dir_operations;
++    } else if (S_ISLNK(cow_inode->i_mode)) {
++      //if (ext3_inode_is_fast_symlink(cow_inode))
++      if((S_ISLNK(cow_inode->i_mode) && cow_inode->i_blocks - 
++          (EXT3_I(cow_inode)->i_file_acl ? 
++           (cow_inode->i_sb->s_blocksize >> 9) : 0)))
++        cow_inode->i_op = &ext3_fast_symlink_inode_operations;
++      else {
++        cow_inode->i_op = &ext3_symlink_inode_operations;
++        ext3_set_aops(cow_inode);
++      }
++    } else {
++      cow_inode->i_op = &ext3_special_inode_operations;
++      /*
++      if (raw_inode->i_block[0])
++        init_special_inode(inode, inode->i_mode,
++                           old_decode_dev(le32_to_cpu(raw_inode->i_block[0])));
++      else
++        init_special_inode(inode, inode->i_mode,
++                           new_decode_dev(le32_to_cpu(raw_inode->i_block[1])));
++      */
++    }
++    
++    /* Dup in the direct cow bitmap */
++    cow_ini->i_cow_bitmap = ini->i_cow_bitmap;
++    ini->i_cow_bitmap     = 0x0000;
++    /* Mark new inode unchangeable */
++    cow_ini->i_flags |= EXT3_UNCHANGEABLE_FL;
++    /* Switch epoch numbers */
++    epoch_number_temp = ini->i_epoch_number;
++    ini->i_epoch_number = cow_ini->i_epoch_number;
++    cow_ini->i_epoch_number = epoch_number_temp;
++    /* Chain Inodes together */
++    cow_ini->i_next_inode = ini->i_next_inode;
++    ini->i_next_inode = cow_inode->i_ino;
++
++    ext3_mark_inode_dirty(handle, cow_inode);
++    ext3_mark_inode_dirty(handle, inode);
++    
++    iput(cow_inode); /* dec i_count */
++
++    err = 0;
++	}
++	ext3_journal_stop(handle);
++	if (err == -ENOSPC && ext3_should_retry_alloc(dir->i_sb, &retries))
++		goto retry;
++	return err;
++
++}
++
++/* ext3_reclaim_dup_inode: rolls back a recently dup'd inode
++ * on error, including epoch number and bitmaps.  Should not
++ * be used for removing versions.  */
++int ext3_reclaim_dup_inode(struct inode *dir, struct inode *inode)
++{
++  handle_t *handle = NULL;
++  int err = 0;
++  struct inode *old_inode = NULL;
++  struct inode *parent = dir;
++
++  if(!parent)
++    parent = inode;
++
++  if(is_bad_inode(inode))
++    return -1;
++  
++  handle = ext3_journal_start(parent, 
++                                 EXT3_DELETE_TRANS_BLOCKS(parent->i_sb));
++  if(IS_ERR(handle))
++    return PTR_ERR(handle);
++
++  if(IS_DIRSYNC(parent))
++    handle->h_sync = 1;
++
++  old_inode = iget(parent->i_sb, EXT3_I_NEXT_INODE(inode));
++  err = PTR_ERR(old_inode);
++  if (!IS_ERR(old_inode)){
++
++    EXT3_I(inode)->i_epoch_number = EXT3_I_EPOCHNUMBER(old_inode);
++    EXT3_I(inode)->i_cow_bitmap   = EXT3_I(old_inode)->i_cow_bitmap;
++    EXT3_I(inode)->i_next_inode   = EXT3_I(old_inode)->i_next_inode;
++    old_inode->i_nlink = 0;
++
++    iput(old_inode);
++    ext3_mark_inode_dirty(handle, inode);
++  }else
++    ext3_error(inode->i_sb, "ext3_reclaim_dup_inode", 
++                  "Couldn't remove dup'd inode.");
++  
++  ext3_journal_stop(handle);
++  
++  return 0;
++}
++
+ /*
+  * directories can handle most operations...
+  */
+diff --git a/ext3/super.c b/ext3co/super.c
+index b348867..b23b529 100644
+--- a/ext3/super.c
++++ b/ext3co/super.c
+@@ -1459,10 +1459,14 @@ static int ext3_fill_super (struct super_block *sb, void *data, int silent)
+ 		set_opt(sbi->s_mount_opt, GRPID);
+ 	if (def_mount_opts & EXT3_DEFM_UID16)
+ 		set_opt(sbi->s_mount_opt, NO_UID32);
++#ifdef CONFIG_EXT3_FS_XATTR
+ 	if (def_mount_opts & EXT3_DEFM_XATTR_USER)
+ 		set_opt(sbi->s_mount_opt, XATTR_USER);
++#endif
++#ifdef CONFIG_EXT3_FS_POSIX_ACL
+ 	if (def_mount_opts & EXT3_DEFM_ACL)
+ 		set_opt(sbi->s_mount_opt, POSIX_ACL);
++#endif
+ 	if ((def_mount_opts & EXT3_DEFM_JMODE) == EXT3_DEFM_JMODE_DATA)
+ 		sbi->s_mount_opt |= EXT3_MOUNT_JOURNAL_DATA;
+ 	else if ((def_mount_opts & EXT3_DEFM_JMODE) == EXT3_DEFM_JMODE_ORDERED)
+@@ -1601,6 +1605,11 @@ static int ext3_fill_super (struct super_block *sb, void *data, int silent)
+ 		sbi->s_hash_seed[i] = le32_to_cpu(es->s_hash_seed[i]);
+ 	sbi->s_def_hash_version = es->s_def_hash_version;
+ 
++  /* Epoch number for versioning -znjp */
++  sbi->s_epoch_number = le32_to_cpu(es->s_epoch_number);
++  printk(KERN_INFO "EXT3-fs: System epoch number: %u\n",
++         sbi->s_epoch_number);
++
+ 	if (sbi->s_blocks_per_group > blocksize * 8) {
+ 		printk (KERN_ERR
+ 			"EXT3-fs: #blocks per group too big: %lu\n",
+@@ -1885,6 +1894,8 @@ static journal_t *ext3_get_journal(struct super_block *sb,
+ 		iput(journal_inode);
+ 		return NULL;
+ 	}
++  /* Make sure the journal never gets versioned -znjp */
++  EXT3_I(journal_inode)->i_flags |= EXT3_UNVERSIONABLE_FL;
+ 	journal->j_private = sb;
+ 	ext3_init_journal_params(sb, journal);
+ 	return journal;
+@@ -2724,6 +2735,38 @@ static int ext3_get_sb(struct file_system_type *fs_type,
+ 	return get_sb_bdev(fs_type, flags, dev_name, data, ext3_fill_super, mnt);
+ }
+ 
++/* Code to update the epoch counter in the super block -znjp */
++unsigned int ext3_take_snapshot(struct super_block *sb){
++
++  struct ext3_sb_info *sbi = NULL;
++  struct ext3_super_block *es = NULL;
++  tid_t target;
++
++  if(NULL == sb){
++    printk("EXT3-fs: superblock is NULL when taking snapshot.\n");
++    return -1;
++  }
++
++  sbi = EXT3_SB(sb);
++  es = sbi->s_es;
++
++  /* Sync the dirty blocks */
++  if (journal_start_commit(EXT3_SB(sb)->s_journal, &target)) {
++    log_wait_commit(EXT3_SB(sb)->s_journal, target);
++	}
++  
++
++  sbi->s_epoch_number = cpu_to_le32(get_seconds());
++  es->s_epoch_number = sbi->s_epoch_number;
++  sb->s_dirt = 1;
++
++  BUFFER_TRACE(EXT3_SB(sb)->s_sbh, "marking dirty");
++  mark_buffer_dirty(sbi->s_sbh);
++  ext3_commit_super (sb, es, 1);
++
++  return (unsigned int)sbi->s_epoch_number;
++}
++
+ static struct file_system_type ext3_fs_type = {
+ 	.owner		= THIS_MODULE,
+ 	.name		= "ext3",
