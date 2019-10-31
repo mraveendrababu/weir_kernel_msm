@@ -8,6 +8,9 @@ int __ext3cow_journal_get_undo_access(const char *where, handle_t *handle,
 				struct buffer_head *bh)
 {
 	int err = journal_get_undo_access(handle, bh);
+	if( 0 ){
+		printk(KERN_DEBUG "ext3cow_journal_get_undo_access \n");
+	}
 	if (err)
 		ext3cow_journal_abort_handle(where, __func__, bh, handle,err);
 	return err;
